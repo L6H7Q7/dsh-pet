@@ -48,6 +48,8 @@ import {
   type MenuLeaf,
   type MenuNode,
 } from '../shared/menu';
+// 悬浮提示：与桌面共用同一份样式与摆位判据（替代原先挂在命中层上的原生 title 提示）
+import { TOOLTIP_CLASS, TOOLTIP_CSS, TOOLTIP_GAP_RATIO, tooltipPlacement } from '../shared/tooltip';
 // 对话弹窗：与桌面共用同一份组件（数据经 host /chat 读写同一份记忆）
 import { mountChatDialog } from '../shared/chat';
 import { petBridge } from './settings';
@@ -105,11 +107,15 @@ const css = [
   '.dsh-pet-stage{position:relative;width:var(--dsh-pet-size,462px);height:calc(var(--dsh-pet-size,462px)*9/16);pointer-events:none}',
   '.dsh-pet-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;opacity:0;transition:opacity .18s ease;transform-origin:center}',
   '.dsh-pet-video.is-front{opacity:1}',
-  '.dsh-pet-hit{position:absolute;pointer-events:auto;cursor:url("/dsh-pet-7340/pic/cursor-grab.png") 16 16, grab;z-index:1}',
+  // 触屏拖拽必需：缺 touch-action:none 时浏览器把手势判成页面滚动并发 pointercancel，
+  // 宠物就不跟手指走；两条 -webkit-* 抑制长按选中与 iOS 长按呼出系统菜单
+  '.dsh-pet-hit{position:absolute;pointer-events:auto;cursor:url("/dsh-pet-7340/pic/cursor-grab.png") 16 16, grab;z-index:1;touch-action:none;-webkit-user-select:none;-webkit-touch-callout:none}',
   '.dsh-pet-hit.dragging{cursor:url("/dsh-pet-7340/pic/cursor-grabbing.png") 16 16, grabbing}',
   '@media (prefers-reduced-motion: reduce){.dsh-pet-video{transition:none}}',
   // 统一右键菜单样式（与桌面注入同一份 MENU_CSS）
   MENU_CSS,
+  // 悬浮提示样式（与桌面注入同一份 TOOLTIP_CSS）
+  TOOLTIP_CSS,
 ].join('\n');
 const cssTag = 'dsh-pet/style.css';
 function injectCss(): void {
@@ -187,6 +193,9 @@ export function makePetUI(rt: {
     const [once, setOnce] = useState(true);
     const [facing, setFacing] = useState('left' as 'left' | 'right');
     const [dragging, setDragging] = useState(false);
+    // 悬浮提示显隐（鼠标进/出命中区翻转；指针捕获期间由拖拽逻辑主动收起，见 handlePointerDown）
+    const [tipOn, setTipOn] = useState(false);
+    const tipRef = useRef<HTMLDivElement | null>(null);
     const [customPos, setCustomPos] = useState<null | { rx: number; ry: number }>(null);
     // 初始角落与边距（来自配置；可被容器更新覆盖）
     const [corner, setCorner] = useState<Corner>(cfg.position.corner);
@@ -225,7 +234,16 @@ export function makePetUI(rt: {
     const frontRef = useRef(0);
     const pendingRef = useRef<null | { anim: string; once: boolean; gen: number }>(null);
     const genRef = useRef(0);
-    const dragRef = useRef({ active: false, dragging: false, sx: 0, sy: 0, offX: 0, offY: 0 });
+    const dragRef = useRef({
+      active: false,
+      dragging: false,
+      sx: 0,
+      sy: 0,
+      offX: 0,
+      offY: 0,
+      // 触屏长按定时器（只有触摸/笔走这条路径，见 handlePointerDown）；null = 当前没有待触发的长按
+      lpTimer: null as ReturnType<typeof setTimeout> | null,
+    });
     const justDraggedRef = useRef(false);
     // 拖拽抛掷物理状态：轨迹样本 / 包围盒左上角实时 px / 弹簧目标与速度 / 弹簧跟随 rAF / 抛掷 rAF
     const dragTrailRef = useRef<DragSample[]>([]);
@@ -1119,6 +1137,25 @@ export function makePetUI(rt: {
     const facingRef = useRef<'left' | 'right'>(facing);
     facingRef.current = facing;
 
+    // ---- 悬浮提示：贴光标显示（与原生 title 的观感一致） ----
+    /** 把提示框摆到光标右下（右边/下边装不下自动翻边并夹回视口内）。
+     *  直接写 DOM style 而不走 React 状态：鼠标每动一下都更新状态会让整个 PetCard 重渲染，
+     *  代价远大于这一次样式写入（root 的位置也是这么直接写的）。
+     *  bounds 用视口——提示是 position:fixed，坐标就是 clientX/clientY 这一套。 */
+    const placeTip = (clientX: number, clientY: number): void => {
+      const tipEl = tipRef.current;
+      if (!tipEl) return;
+      const viewport = document.documentElement;
+      const p = tooltipPlacement(
+        { x: clientX, y: clientY },
+        { w: tipEl.offsetWidth, h: tipEl.offsetHeight },
+        { x: 0, y: 0, w: viewport.clientWidth, h: viewport.clientHeight },
+        size * TOOLTIP_GAP_RATIO,
+      );
+      tipEl.style.left = p.x + 'px';
+      tipEl.style.top = p.y + 'px';
+    };
+
     // ---- 点击 vs 拖拽 ----
     const handlePointerDown = (e: ReactNS.PointerEvent<HTMLDivElement>) => {
       // 只认左键：右键进入拖拽判定会与右键菜单打架（右键不拖拽，两端一致）
@@ -1169,6 +1206,8 @@ export function makePetUI(rt: {
       dragTrailRef.current = [];
       e.currentTarget.classList.add('dragging');
       e.currentTarget.setPointerCapture(e.pointerId);
+      // 收起悬浮提示：指针捕获期间 pointerleave 不会触发，不主动收就会一直挂在宠物头上跟着跑
+      setTipOn(false);
       const rootEl = rootRef.current;
       let offX = 0;
       let offY = 0;
@@ -1178,13 +1217,49 @@ export function makePetUI(rt: {
         offY = e.clientY - (rr.top + rr.height / 2);
         boxPxRef.current = { x: rr.left, y: rr.top };
       }
-      dragRef.current = { active: true, dragging: false, sx: e.clientX, sy: e.clientY, offX, offY };
+      dragRef.current = { active: true, dragging: false, sx: e.clientX, sy: e.clientY, offX, offY, lpTimer: null };
+      // 触屏长按 500ms 打开右键菜单：复用同一套按下判定。手指移动超过 8px 即取消；
+      // 鼠标与笔不走这条分支（它们本来就有右键，无需长按替代）。
+      if (e.pointerType !== 'mouse' && e.pointerType !== 'pen') {
+        const lpEl = e.currentTarget;
+        const lpId = e.pointerId;
+        const lpX = e.clientX;
+        const lpY = e.clientY;
+        dragRef.current.lpTimer = setTimeout(() => {
+          dragRef.current.lpTimer = null;
+          const dl = dragRef.current;
+          if (!dl.active || dl.dragging) return;
+          // 结束本次按压：松手时既不抛掷也不播点击动画（pressScoreFiredRef 标记为已处理）
+          dl.active = false;
+          pressScoreFiredRef.current = true;
+          if (lpEl.hasPointerCapture(lpId)) lpEl.releasePointerCapture(lpId);
+          console.log('[dsh-pet] ' + new Date().toTimeString().slice(0, 8) + ' pet=' + cfg.id + ' -> [TOUCH-MENU]');
+          // 与鼠标右键同一个入口：派发 contextmenu 交给 handleContextMenu
+          lpEl.dispatchEvent(
+            new MouseEvent('contextmenu', {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              clientX: lpX,
+              clientY: lpY,
+              button: 2,
+            }),
+          );
+        }, 500);
+      }
     };
     const handlePointerMove = (e: ReactNS.PointerEvent<HTMLDivElement>) => {
+      // 提示跟随光标：必须在拖拽早退之前——拖拽期间提示本来就收起了，但非拖拽的每次移动都要跟上
+      if (tipOn) placeTip(e.clientX, e.clientY);
       const d = dragRef.current;
       if (!d.active) return;
       const dx = e.clientX - d.sx;
       const dy = e.clientY - d.sy;
+      // 长按窗口内手指移动超过 8px 即取消（拖拽阈值 DRAG_THRESHOLD 不动）
+      if (d.lpTimer && Math.hypot(dx, dy) > 8) {
+        clearTimeout(d.lpTimer);
+        d.lpTimer = null;
+      }
       if (!d.dragging) {
         if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
         d.dragging = true;
@@ -1208,6 +1283,11 @@ export function makePetUI(rt: {
     };
     const handlePointerUp = (e: ReactNS.PointerEvent<HTMLDivElement>) => {
       const d = dragRef.current;
+      // pointercancel 也走这个处理器（见 JSX onPointerCancel），所以长按定时器在这里一并清掉
+      if (d.lpTimer) {
+        clearTimeout(d.lpTimer);
+        d.lpTimer = null;
+      }
       const wasDragging = d.dragging;
       d.active = false;
       d.dragging = false;
@@ -1253,6 +1333,19 @@ export function makePetUI(rt: {
           // 原地放下：提交 customPos → React 按 rootStyle（含边界夹取）重排位置
           setCustomPos({ rx: (px + halfW) / window.innerWidth, ry: (py + halfH) / window.innerHeight });
         }
+      }
+      // 提示复位：点击/拖拽期间收起的悬浮提示，指针仍在命中区内就恢复——指针捕获期间
+      // pointerleave 不触发，不复位就得把鼠标移出去再移回来才重现（与桌面 onPointerUp 同一处理）。
+      // 先按松手位置摆好再显示，否则会重现上一次的位置。
+      const hitRect = e.currentTarget.getBoundingClientRect();
+      if (
+        e.clientX >= hitRect.left &&
+        e.clientX <= hitRect.right &&
+        e.clientY >= hitRect.top &&
+        e.clientY <= hitRect.bottom
+      ) {
+        placeTip(e.clientX, e.clientY);
+        setTipOn(true);
       }
     };
     // 左键点身体**顺带**触发一次余额：与 /balance 命令、桌面「查看余额」**同一条**路径——
@@ -1441,7 +1534,7 @@ export function makePetUI(rt: {
       }
       return null;
     })();
-    const commonVideoProps = { muted: true, playsInline: true, autoPlay: true, title: cfg.name };
+    const commonVideoProps = { muted: true, playsInline: true, autoPlay: true };
     const hitProps = {
       className: 'dsh-pet-hit',
       style: {
@@ -1455,8 +1548,14 @@ export function makePetUI(rt: {
       onPointerMove: handlePointerMove,
       onPointerUp: handlePointerUp,
       onPointerCancel: handlePointerUp,
+      onPointerEnter: (e: ReactNS.PointerEvent<HTMLDivElement>) => {
+        placeTip(e.clientX, e.clientY); // 先摆位再显示：否则会先在兜底坐标闪一帧
+        setTipOn(true);
+      },
+      onPointerLeave: () => setTipOn(false),
       onContextMenu: handleContextMenu,
-      title: cfg.name,
+      // 原先这里挂 title（原生系统提示）：已换成自绘浮层，但无障碍名称不能跟着丢
+      'aria-label': cfg.name,
     };
     return h('div', {
       ref: rootRef,
@@ -1482,6 +1581,16 @@ export function makePetUI(rt: {
             h('video', Object.assign({}, commonVideoProps, { ref: videoBRef, className: 'dsh-pet-video' })),
             h('div', hitProps),
           ],
+        }),
+        // 悬浮提示（替代原生 title）：元素常驻、只切 class——挂卸节点吃不到 .12s 淡入过渡；
+        // 坐标由 placeTip 按光标直接写 style（这里刻意不传 style，免得 React 覆盖）。
+        // 文本 = 宠物显示名（host 已保证非空）；pointer-events:none 见 TOOLTIP_CSS，
+        // 否则它会挡住命中区，mouseenter/leave 互相打架导致闪烁。
+        h('div', {
+          ref: tipRef,
+          className: TOOLTIP_CLASS + (tipOn ? ' is-on' : ''),
+          'aria-hidden': 'true',
+          children: cfg.name,
         }),
       ],
     });

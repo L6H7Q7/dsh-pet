@@ -13,6 +13,7 @@ const CONFIG = {
   configUrl: params.get('configUrl') || 'http://127.0.0.1:3080/dsh-pet-7340/config',
   scale: Number(params.get('scale') || '1'),
   petIndex: Number(params.get('petIndex') || '0'),
+  topInsetRatio: Number(params.get('topInsetRatio') || '0'),
 };
 
 // ---------- 渲染端坐标系统一约定（DESIGN.md §3.5） ----------
@@ -30,6 +31,9 @@ function toLocal(v) {
 // bridge 模式（DSH_PET_BRIDGE=1）：请求走自定义 scheme，经 Electron 主进程转宿主管道——
 // 绕开 DSH Desktop 2.0.3+ 的浏览器访问闸门（只放行带令牌的请求，插件自拉进程的裸 HTTP 全 403）
 const BRIDGE = params.get('bridge') === '1';
+// 工具项「打开网站」的去向（主进程按宿主形态经 query 注入，见 main.js 的 OPEN_TARGET）：
+// desktop = 宿主是 DSH 桌面应用，菜单项改叫「打开 DeepSeek Harness」并唤起桌面应用主窗口；site = 打开站点。
+const OPEN_TARGET = params.get('openTarget') === 'desktop' ? 'desktop' : 'site';
 // 视口 = 全部显示器工作区的外接矩形（多显示器时即整个桌面；窗口只是宠物的一块局部画布）。
 // 它只是**坐标系原点与比例换算基准**：位置比例（customPos）、漫游 ratio 都按它算。
 // x/y = 外接矩形左上角（多显示器时原点非 0）——visibleClampRect 计算「窗口 ∩ 工作区」需要它；
@@ -53,6 +57,8 @@ const VIEW = {
 };
 /** 逐显示器工作区，**视口相对坐标**（= 屏幕坐标 − VIEW 原点）。抛掷/漫游/菜单夹取都走它们的并集 */
 let AREAS = [];
+/** 菜单/聊天框/提示仍限制在工作区，不能随宠物进入菜单栏或 Dock。 */
+let WORK_AREAS = [];
 /** 逐显示器**完整面板**（含任务栏区，视口相对坐标，与 AREAS 同序）：抛掷「越界侧有没有邻屏」
  *  的探测用它——任务栏在接缝处挖出的工作区条带不当墙（见 shared/physics.ts） */
 let PANELS = [];
@@ -74,6 +80,13 @@ function applyDeskGeometry(geo) {
     -VIEW.x,
     -VIEW.y,
   );
+  const workAreas = geo && Array.isArray(geo.workAreas) && geo.workAreas.length === list.length ? geo.workAreas : list;
+  WORK_AREAS = S.translateRects(
+    workAreas.map((a) => ({ x: toLocal(a.x), y: toLocal(a.y), width: toLocal(a.width), height: toLocal(a.height) })),
+    -VIEW.x,
+    -VIEW.y,
+  );
+  CONFIG.topInsetRatio = Number(geo.topInsetRatio) || 0;
   // 面板与工作区同序；缺失/长度不符（老主进程）退化为工作区，保持旧行为
   const panelsList =
     geo && Array.isArray(geo.panels) && geo.panels.length === list.length
@@ -117,6 +130,14 @@ applyDeskGeometry({
     return null;
   })(),
   primaryIndex: Number(params.get('primaryIndex') || 0),
+  workAreas: (() => {
+    try {
+      return JSON.parse(params.get('workAreas') || 'null');
+    } catch {
+      return null;
+    }
+  })(),
+  topInsetRatio: CONFIG.topInsetRatio,
 });
 const ORIGIN = new URL(CONFIG.configUrl).origin;
 /** 宿主 /dsh-pet-7340 前缀：bridge 走自定义 scheme（主进程转发），否则 HTTP 直连宿主 */

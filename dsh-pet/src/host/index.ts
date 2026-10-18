@@ -100,9 +100,10 @@ import {
   WorkStatusStore,
   type WorkStatusTurnContext,
 } from './work-status';
-import { agentErrorFrame, reduceNotifyFrame, type HostNotifyFrame } from './notify-events';
+import { agentErrorFrame, reduceNotifyFrame, shouldNotifySession, type HostNotifyFrame } from './notify-events';
 import { profileNameFrom, storageEntries } from './storage-paths';
 import { PollStateStore } from './state';
+import { timeContextOf } from './time-context';
 import {
   HelperProcess,
   defaultElectronExe,
@@ -114,8 +115,8 @@ import {
 
 /** 插件行 id（与 cordis.patch.yml 一致） */
 export const name = 'pet';
-/** 需要注入的服务：webServer（路由）+ agentDefaultModel（当前服务商）+ credentials（凭证）+ llm（对话模型调用）+ commands（/balance 斜杠命令） */
-export const inject = ['webServer', 'agentDefaultModel', 'credentials', 'llm', 'commands'];
+/** 需要注入的服务：webServer（路由）+ agentDefaultModel（当前服务商）+ credentials（凭证）+ llm（对话模型调用）+ commands（/balance 斜杠命令）+ connection（桌面 Helper「打开网站」用的已鉴权站点 URL） */
+export const inject = ['webServer', 'agentDefaultModel', 'credentials', 'llm', 'commands', 'connection'];
 
 /** 本包目录：宿主构建产物位于 lib/，其上一级即包根。 */
 const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -128,6 +129,15 @@ const PACKAGE_MEMES_DIR = join(PACKAGE_ROOT_ASSETS, 'memes');
 
 /** 路由前缀 */
 const ROUTE_PREFIX = '/dsh-pet-7340';
+
+/**
+ * 宿主是不是 **DSH 桌面应用**（Electron 宿主）。
+ *
+ * 判据只用 `process.versions.electron`：桌面应用以 `ELECTRON_RUN_AS_NODE=1` 跑宿主（见 dsh.cmd），
+ * 该字段照样在；而 `dsh web` / 独立模式都是纯 Node 进程，取不到它。据此把「打开网站」自动分派：
+ * 桌面宿主 → 唤起桌面应用窗口（helper 走 `dsh://open`），其余 → 浏览器打开站点。
+ */
+const isDesktopHost = (): boolean => Boolean(process.versions.electron);
 
 /** 不同扩展名对应的 Content-Type 映射 */
 const MIME: Record<string, string> = {
@@ -395,14 +405,19 @@ export function apply(ctx: any): void {
   // ---- 配置消费：唯一入口 readAllConfig（./config）——返回值绝对正确，这里只读字段，零校验 ----
 
   /** 某宠物的最终人设 system：所属条目（非文件宠物 → main 条目）的 whisperPrompt（合并器已填默认）
-   *  + 无条件追加一句名字声明（name，缺失已按 id）——碎碎念与对话共用同一拼装。 */
+   *  + 无条件追加一句名字声明（name，缺失已按 id）——碎碎念与对话共用同一拼装。
+   *  + 末尾追加一行**时间背景**（time-context.ts：日期/星期/时刻/时段/工作日或周末）：
+   *    碎碎念与对话各自每次生成都会重新走这里，所以拿到的永远是**当前**时刻，不需要额外的刷新机制；
+   *    非法 Date 时它为空串，此时整行不加（宁可没有时间信息，也不把 NaN 拼进提示词）。 */
   const petSystemPrompt = (petId: string, cfg: Record<string, Record<string, unknown>>): string => {
     const found = findPetInstance(cfg, petId);
     const conf = found ? found.conf : (cfg.main ?? {});
     const prompt = typeof conf.whisperPrompt === 'string' ? conf.whisperPrompt : '';
     const name = found ? String(found.pet.name || found.pet.id || petId) : petId;
     const nameLine = '你的名字是“' + name + '”。';
-    return prompt ? prompt + '\n' + nameLine : nameLine;
+    const base = prompt ? prompt + '\n' + nameLine : nameLine;
+    const time = timeContextOf(new Date());
+    return time ? base + '\n' + time : base;
   };
 
   /** 对话记忆轮数（1 轮 = 1 问 1 答）：所属条目/主条目的 chatMemoryRounds（合并器已填默认非负数字） */
@@ -637,6 +652,11 @@ export function apply(ctx: any): void {
       return;
     }
     const origin = `http://127.0.0.1:${port}`;
+    // 右键「打开网站」交出去的是裸 origin：DSH 只在 `GET /` 接受本进程的启动令牌，换发绑定 authority 的
+    // 签名 Cookie，其余请求一律 401 —— 默认浏览器没有该 authority 的 Cookie 时必然打不开（#87）。
+    // 令牌等价登录态：只经子进程环境变量递到 helper 内存，不落盘、不进日志；authority 必须保持
+    // 127.0.0.1（与 localhost 算两套 Cookie），故这里传 origin 而不是另拼地址。
+    const siteUrl = ctx.connection.authenticatedUrl(origin);
     // 桌面渲染端也从同一份 handlePetRoute 拿成品配置（每只宠物一个局部小窗口；经管道，不走 HTTP——
     // DSH Desktop 2.0.3+ 会拦插件自拉进程的裸 HTTP 请求，浏览器访问闸门只放行带令牌的请求）
     const configUrl = `${origin}${ROUTE_PREFIX}/config`;
@@ -645,6 +665,12 @@ export function apply(ctx: any): void {
         electronPath,
         env: {
           DSH_PET_CONFIG_URL: configUrl,
+          // 已鉴权站点 URL（含本进程启动令牌）：只供 helper 的「打开网站」使用，任何日志都不许出现它
+          DSH_PET_SITE_URL: siteUrl,
+          // 宿主形态决定工具项「打开网站」的去向（同名菜单项，两端两种语义）：
+          //   desktop = 宿主是 DSH 桌面应用 → 唤起桌面应用主窗口（helper 走 dsh://open，见 main.js）
+          //   site    = dsh web / 独立模式 → 系统默认浏览器打开站点（原行为，别破坏）
+          DSH_PET_OPEN_TARGET: isDesktopHost() ? 'desktop' : 'site',
           DSH_PET_SCALE: '1',
           // 打开 bridge 协议：main.js 注册 dsh-pet-bridge scheme，把渲染端请求经管道转给宿主
           DSH_PET_BRIDGE: '1',
@@ -1313,13 +1339,18 @@ export function apply(ctx: any): void {
     const sessionDispose = ctx.on(
       'session/event',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (_session: any, event: any) => {
+      (session: any, event: any) => {
+        // 会话门（issue #82）：子代理 / 委派会话不发通知——你等的是父对话，不是某一路子代理跑完。
+        // 判据用 header.origin（不是 parentSession，那会把普通 fork 的主对话一起静音），
+        // 判据不可用时放行，绝不把通知整体打哑。详见 notify-events.ts 的 shouldNotifySession。
+        if (!shouldNotifySession(session)) return;
         const frame = reduceNotifyFrame(event as Parameters<typeof reduceNotifyFrame>[0]);
         if (frame) pushNotifyFrame(frame);
       },
     );
     // agent/error（agent-loop dispatch.emit）：无回合位置的生成失败；0.1.5 新增，
     // 旧版无此事件 = 少一条通知（turn/end error 分支已覆盖大部分失败场景），不报错。
+    // **这道门管不到它**：载荷只有 { turn, step, error }，不带会话标识，无从判定来源。
     const errorDispose = ctx.on(
       'agent/error',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

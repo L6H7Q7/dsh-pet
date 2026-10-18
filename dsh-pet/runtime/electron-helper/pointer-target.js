@@ -19,6 +19,7 @@ const HIT_BOX = { x0: 200, y0: 50, x1: 440, y1: 335 };
 /** 动画画布尺寸：高取 shared 的 CANVAS_H，宽与 sprite.js / shared 一样用字面量 640（shared 未导出宽） */
 const CANVAS_H = 360;
 const STAGE_W = 640;
+const FEET_Y = 330;
 
 /**
  * 窗口矩形 → 宠物身体命中区的屏幕矩形（DIP）。
@@ -31,25 +32,50 @@ function spriteHitRect(bounds) {
   const margin = Math.round(bounds.width / 4);
   const stageW = bounds.width - margin * 2;
   const stageH = (stageW * CANVAS_H) / STAGE_W;
+  const bottomPad = (stageH * (CANVAS_H - FEET_Y)) / CANVAS_H;
   return {
     left: bounds.x + margin + (HIT_BOX.x0 / STAGE_W) * stageW,
-    top: bounds.y + margin + (HIT_BOX.y0 / CANVAS_H) * stageH,
+    top: bounds.y + margin + bottomPad + (HIT_BOX.y0 / CANVAS_H) * stageH,
     right: bounds.x + margin + (HIT_BOX.x1 / STAGE_W) * stageW,
-    bottom: bounds.y + margin + (HIT_BOX.y1 / CANVAS_H) * stageH,
+    bottom: bounds.y + margin + bottomPad + (HIT_BOX.y1 / CANVAS_H) * stageH,
   };
 }
 
 /** 判定轮询间隔（ms，与 issue #55 报告者实测值一致） */
 const POINTER_POLL_MS = 60;
 
+/** 光标停在窗口余量区（非 busy）的最长保持时间（ms）：超过即恢复穿透 */
+const OFF_BODY_RELEASE_MS = 400;
+
+/**
+ * 光标相对窗口的分区：'outside' | 'body' | 'margin'。
+ *
+ * 主进程除判定外还要按分区累计余量区停留时长，判定区域只在此处维护，避免两条通道漂移。
+ *
+ * @param {{x:number,y:number,width:number,height:number}} bounds 窗口矩形（DIP）
+ * @param {{x:number,y:number}} point 真实光标位置（DIP）
+ * @returns {'outside'|'body'|'margin'} 分区
+ */
+function pointerZone(bounds, point) {
+  const inWindow =
+    point.x >= bounds.x &&
+    point.x < bounds.x + bounds.width &&
+    point.y >= bounds.y &&
+    point.y < bounds.y + bounds.height;
+  if (!inWindow) return 'outside';
+  const r = spriteHitRect(bounds);
+  const inSprite = point.x >= r.left && point.x <= r.right && point.y >= r.top && point.y <= r.bottom;
+  return inSprite ? 'body' : 'margin';
+}
+
 /**
  * 该不该让窗口保持穿透（= `setIgnoreMouseEvents` 的第一个参数）。
  *
  * 规则（与 issue #55 报告者实测的表一致）：
- *  - 渲染端正拿着鼠标输入（拖拽中 / 菜单开着 / 对话弹窗开着）→ **不穿透**，最高优先级；
+ *  - 拖拽中 → **不穿透**，最高优先级；菜单/聊天框只让各自控件矩形接收点击；
  *  - 光标在宠物身体上 → 不穿透（可交互）；
- *  - 光标在窗口内、宠物外 → **保持当前状态**：否则渲染端自绘的右键菜单/对话弹窗，鼠标一移出身体
- *    就立刻变穿透，点不到；
+ *  - 光标在窗口内、宠物外 → **保持当前状态**（渲染端自绘的右键菜单/对话弹窗要可点），
+ *    但非 busy 且连续停留超过 OFF_BODY_RELEASE_MS 后强制恢复穿透；
  *  - 光标在窗口外 → 恢复穿透（透明像素不挡下层应用）。
  *
  * 为什么 busy 必须优先于位置判定（0.2.10 的回归）：本函数判定的是**光标与窗口矩形**的关系，
@@ -67,20 +93,38 @@ const POINTER_POLL_MS = 60;
  * @param {boolean} ignoring 窗口当前是否穿透（取自主进程的 windowIgnore 镜像，不用本地副本：
  *   渲染端那条通道也在翻转它，本地副本会与之失步）
  * @param {boolean} busy 渲染端是否正在用这个窗口的鼠标输入（拖拽中/菜单开/弹窗开，见 inputBusy）
+ * @param {number} [offBodyMs=0] 光标在窗口余量区（非 busy）的连续停留时长，超时即恢复穿透
+ * @param {{dragging:boolean, rects:Array<{x:number,y:number,width:number,height:number}>}} [input]
+ *   新渲染端上报的窗口局部交互矩形。菜单/聊天框只占自己的区域；拖拽仍拥有完整输入租约。
  * @returns {boolean} 新的穿透状态
  */
-function decideWindowIgnore(bounds, point, ignoring, busy) {
-  if (busy) return false; // 渲染端正拿着输入：绝不翻回穿透（翻了就断它的输入链）
-  const inWindow =
-    point.x >= bounds.x &&
-    point.x < bounds.x + bounds.width &&
-    point.y >= bounds.y &&
-    point.y < bounds.y + bounds.height;
-  if (!inWindow) return true; // 窗外：恢复穿透
-  const r = spriteHitRect(bounds);
-  const inSprite = point.x >= r.left && point.x <= r.right && point.y >= r.top && point.y <= r.bottom;
-  if (inSprite) return false; // 宠物身上：可交互
-  return ignoring; // 窗口余量区：保持（菜单/弹窗可点）
+function decideWindowIgnore(bounds, point, ignoring, busy, offBodyMs = 0, input) {
+  if (busy) {
+    if (!input || input.dragging) return false; // 兼容旧渲染端；拖拽租约绝不被位置判定打断
+    const inControl = input.rects.some(
+      (r) =>
+        point.x >= bounds.x + r.x &&
+        point.x < bounds.x + r.x + r.width &&
+        point.y >= bounds.y + r.y &&
+        point.y < bounds.y + r.y + r.height,
+    );
+    return !inControl && pointerZone(bounds, point) !== 'body';
+  }
+  const zone = pointerZone(bounds, point);
+  if (zone === 'outside') return true; // 窗外：恢复穿透
+  if (zone === 'body') return false; // 宠物身上：可交互
+  if (offBodyMs >= OFF_BODY_RELEASE_MS) return true; // 余量区停留超时：恢复穿透
+  return ignoring; // 余量区：保持（菜单/弹窗由 busy 覆盖）
 }
 
-module.exports = { HIT_BOX, CANVAS_H, STAGE_W, POINTER_POLL_MS, spriteHitRect, decideWindowIgnore };
+module.exports = {
+  HIT_BOX,
+  CANVAS_H,
+  STAGE_W,
+  FEET_Y,
+  POINTER_POLL_MS,
+  OFF_BODY_RELEASE_MS,
+  spriteHitRect,
+  pointerZone,
+  decideWindowIgnore,
+};

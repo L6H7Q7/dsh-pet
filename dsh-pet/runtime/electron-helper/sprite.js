@@ -93,6 +93,9 @@ class PetSprite {
     // 余额气泡
     this.bubbleOn = false;
     this.bubbleTimer = null;
+    // 悬浮提示（替代原生 title 属性）：显隐 + 最近一次光标位置（**视口坐标**，见 renderTip）
+    this.tipOn = false;
+    this.tipCursor = null;
     this.balanceView = null;
     this.balanceWrap = false; // true = 当前余额气泡是不可用的「文字说明」（多行，需换行变体）
     this.lastBodyClickBalanceAt = 0; // 左键点身体「顺带」触发余额的上次时间（节流用，见 triggerBalanceFromBodyClick）
@@ -138,7 +141,6 @@ class PetSprite {
       v.muted = true;
       v.playsInline = true;
       v.autoplay = true;
-      v.title = this.pet.name;
     }
     this.hit = document.createElement('div');
     this.hit.className = 'pet-hit';
@@ -146,14 +148,21 @@ class PetSprite {
     this.hit.style.top = (S.HIT_BOX.y0 / 360) * 100 + '%';
     this.hit.style.width = ((S.HIT_BOX.x1 - S.HIT_BOX.x0) / 640) * 100 + '%';
     this.hit.style.height = ((S.HIT_BOX.y1 - S.HIT_BOX.y0) / 360) * 100 + '%';
-    this.hit.title = this.pet.name;
+    // 原先这里挂 title（原生系统提示）：已换成自绘浮层，但无障碍名称不能跟着丢
+    this.hit.setAttribute('aria-label', this.pet.name);
     this.bubble = document.createElement('div');
     this.bubble.className = 'pet-bubble';
+    // 悬浮提示：与气泡同处 this.el 内的绝对定位浮层，位置/翻转由 renderTip 决定，
+    // 样式走 shared 的 TOOLTIP_CSS（renderer.js 注入，与浏览器端同一份）
+    this.tip = document.createElement('div');
+    this.tip.className = S.TOOLTIP_CLASS;
+    this.tip.setAttribute('aria-hidden', 'true');
 
     stage.appendChild(this.videoA);
     stage.appendChild(this.videoB);
     stage.appendChild(this.hit);
     this.el.appendChild(this.bubble);
+    this.el.appendChild(this.tip);
     this.el.appendChild(stage);
     rootEl.appendChild(this.el);
     this.position();
@@ -161,6 +170,11 @@ class PetSprite {
     // 事件（与浏览器同一套：pointerdown/move、click、window pointerup/cancel）
     const ac = new AbortController();
     this.ac = ac;
+    // 级联菜单新增面板、聊天输入增长都可能在鼠标停住时发生，不能只等下一次 mousemove。
+    this.inputRegionResize = new ResizeObserver(() => this.syncInputRegions());
+    this.inputRegionElements = new Set();
+    this.inputRegionMutation = new MutationObserver(() => this.syncInputRegions());
+    this.inputRegionMutation.observe(document.body, { childList: true, subtree: true });
     this.hit.addEventListener('pointerdown', (e) => this.onPointerDown(e), { signal: ac.signal });
     this.hit.addEventListener('pointermove', (e) => this.onPointerMove(e), { signal: ac.signal });
     this.hit.addEventListener('click', () => this.onClick(), { signal: ac.signal });
@@ -173,12 +187,23 @@ class PetSprite {
     // mouseleave 保证光标离开窗口立即恢复穿透（透明像素不挡下层应用，与浏览器一致）。
     window.addEventListener('mousemove', (e) => this.onMouseMove(e), { signal: ac.signal });
     window.addEventListener(
+      'blur',
+      () => {
+        // 切到其它应用后旧菜单不应继续占着整个透明窗口；丢失松手时也释放拖拽。
+        this.closeMenu();
+        if (this.dragState.active) this.onPointerUp();
+        if (!this.chatOpen) this.setInteractive(false);
+      },
+      { signal: ac.signal },
+    );
+    window.addEventListener(
       'mouseleave',
       () => {
-        // 光标离开窗口：菜单若开着立刻收起（菜单是窗口内 DOM，离开即不可达），再恢复穿透；
-        // 对话弹窗开着则不恢复——弹窗是窗口内 DOM，鼠标还要回来点输入框（与 menuOpen 同守卫）
+        // 光标离开窗口：菜单若开着立刻收起（菜单是窗口内 DOM，离开即不可达），再恢复穿透。
+        // 拖拽中与对话弹窗开着都不恢复：前者会绕过 busy 造成穿透并丢失 pointerup，
+        // 后者要留光标回来点输入框。
         this.closeMenu();
-        if (!this.chatOpen) this.setInteractive(false);
+        if (!this.chatOpen && !this.dragState.active) this.setInteractive(false);
       },
       { signal: ac.signal },
     );
@@ -218,6 +243,9 @@ class PetSprite {
 
   dispose() {
     this.ac.abort();
+    this.inputRegionMutation.disconnect();
+    this.inputRegionResize.disconnect();
+    this.inputRegionElements.clear();
     if (this.bubbleTimer !== null) window.clearTimeout(this.bubbleTimer);
     if (this.whisperTimer !== null) window.clearTimeout(this.whisperTimer);
     if (this.workTimer !== null) window.clearTimeout(this.workTimer);
@@ -259,6 +287,10 @@ class PetSprite {
         fly ? toScreen(fly.vy) : 0,
       );
     }
+    // 位置变了（宠物漫游/拖拽/飞行，窗口跟着动）：提示若正显示必须重摆一次——它跟的是光标，
+    // 而光标存的是视口坐标，窗口一移，光标相对窗口的位置就变了，不重摆提示会跟着窗口漂走。
+    // 只在显示时重摆：漫游逐帧调本函数，没显示提示时不做无谓的 DOM 写入。
+    if (this.tipOn) this.renderTip();
   }
 
   // 角落/边距 → 窗口位置；拖拽后按会话内位置（比例）还原——**松手无任何边界夹取**，
@@ -279,7 +311,10 @@ class PetSprite {
         // marginX/marginY 是配置里的绝对像素：页面级缩放（§3.5）已统一放大整窗，
         // 配置值不再手工乘 CONFIG.scale——150% 屏上与「线性化 + 旧 CONFIG.scale 补偿」观感一致
         marginX: this.pet.position.marginX,
-        marginY: this.pet.position.marginY,
+        // macOS 顶部边距对齐身体命中盒，扣掉动画画布头顶留白。
+        marginY:
+          this.pet.position.marginY -
+          (this.pet.position.corner.startsWith('top-') ? this.size * CONFIG.topInsetRatio : 0),
         size: this.size,
         W,
         H,
@@ -295,6 +330,7 @@ class PetSprite {
   throwSpaceOf() {
     if (!this.space || this.space.areas !== AREAS || this.space.panels !== PANELS) {
       this.space = S.throwSpace({ areas: AREAS, panels: PANELS, size: this.size, sideAllow: this.sideAllow });
+      for (const b of this.space.bounds) b.minY -= this.size * CONFIG.topInsetRatio;
     }
     return this.space;
   }
@@ -801,6 +837,9 @@ class PetSprite {
     this.stopMove();
     this.dragTrail = [];
     this.hit.classList.add('dragging');
+    // 收起悬浮提示：拖拽期间窗口逐帧跟随光标，指针始终在身体内、onMouseMove 的 inBody 恒为真，
+    // 不主动收就会让提示跟着宠物一路飘（松开后由 onPointerUp 按指针位置复位）
+    this.setTip(false);
     this.stopMove();
     try {
       this.hit.setPointerCapture(e.pointerId);
@@ -861,6 +900,21 @@ class PetSprite {
     this.stopDragFollow(); // 弹簧跟随立即停（位置定格在实时 this.pos）
     this.stage.style.transform = 'translateY(' + this.bottomPad + 'px)';
     this.syncInputBusy(); // 拖拽结束：交还给常规判定（幂等，非拖拽时多调一次不发 IPC）
+    // 提示复位：点击/拖拽期间收起的悬浮提示，指针仍在命中区内就恢复（与浏览器 handlePointerUp 同一处理）。
+    // 用 hitRect 几何判定而不是 getBoundingClientRect：命中区是窗口坐标里的权威几何，与 onMouseMove 同源。
+    // 位置有讲究：必须留在 syncInputBusy() 之后——pointer-target.test.ts 只扫本函数开头 400 字符
+    // 来找上报调用，插到它前面会把上报挤出窗口（该断言守的是"松手必上报，否则窗口粘在可交互"）。
+    if (e && Number.isFinite(e.clientX)) {
+      const r = this.hitRect;
+      const px = e.clientX - this.margin.l;
+      const py = e.clientY - this.margin.t;
+      // 先按松手位置更新光标再摆位/显示，否则会重现拖拽前的位置（与浏览器 placeTip 同一处理）
+      this.tipCursor = {
+        x: this.pos.x - this.margin.l + e.clientX,
+        y: this.pos.y - this.margin.t + e.clientY,
+      };
+      this.setTip(px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h);
+    }
     if (wasDragging) {
       this.justDragged = true;
       setTimeout(() => {
@@ -924,7 +978,7 @@ class PetSprite {
    * 输入链就断了（拖拽会定格在最后一次采样上，松手也没人报 pointerup → 宠物按旧速度飞出去）。
    *
    * 这个信号是**渲染端专有的知识**：只有它知道"我正在用输入"，主进程无从推断（光看光标位置和窗口
-   * 位移分不清"拖拽跟手"和"漫游/抛掷"）。所以由渲染端上报，主进程的兜底通道据此闭嘴。
+   * 位移分不清"拖拽跟手"和"漫游/抛掷"）。同时上报控件矩形：菜单/聊天框外的透明区域继续穿透。
    */
   inputBusy() {
     return this.dragState.active || this.menuOpen || this.chatOpen;
@@ -936,11 +990,39 @@ class PetSprite {
    * 本方法表达"我有没有在用输入"（优先级更高，覆写常规判定）。
    */
   syncInputBusy() {
+    this.syncInputRegions();
     const busy = this.inputBusy();
     if (busy === this._inputBusy) return;
     this._inputBusy = busy;
     window.__dshPetDebug.inputBusy = busy;
     if (window.petBridge) window.petBridge.setInputBusy(busy);
+  }
+
+  syncInputRegions() {
+    if (!window.petBridge || !window.petBridge.setInputRegions) return;
+    const rects = [];
+    const controls = [...document.querySelectorAll('.dsh-pet-menu-column, .dsh-pet-chat')];
+    for (const el of this.inputRegionElements) {
+      if (!controls.includes(el)) {
+        this.inputRegionResize.unobserve(el);
+        this.inputRegionElements.delete(el);
+      }
+    }
+    for (const el of controls) {
+      if (!this.inputRegionElements.has(el)) {
+        this.inputRegionElements.add(el);
+        this.inputRegionResize.observe(el);
+      }
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        rects.push({ x: toScreen(r.x), y: toScreen(r.y), width: toScreen(r.width), height: toScreen(r.height) });
+      }
+    }
+    const input = { dragging: this.dragState.active, rects };
+    const key = JSON.stringify(input);
+    if (key === this._inputRegions) return;
+    this._inputRegions = key;
+    window.petBridge.setInputRegions(input);
   }
 
   setInteractive(flag) {
@@ -951,7 +1033,65 @@ class PetSprite {
     if (window.petBridge) window.petBridge.setInteractive(next);
   }
 
+  /**
+   * 悬浮提示显隐（替代原先挂在命中层 title 上的原生系统提示）。
+   *
+   * 由 onMouseMove 的「光标在不在身体命中区」驱动，而不是 pointerenter/pointerleave：
+   * 身体外整窗是穿透的（main 的 setIgnoreMouseEvents(true, {forward:true})），光标离开身体时
+   * pointerleave 未必派发，提示会赖在屏幕上不走；几何判定与点击穿透翻转同源，才不会有第二种口径。
+   */
+  setTip(on) {
+    const next = !!on;
+    if (next === this.tipOn) return;
+    this.tipOn = next;
+    this.renderTip();
+  }
+
+  /**
+   * 悬浮提示渲染：文本 = 宠物显示名（host 已保证 name = rawName || id，不会空）；
+   * 位置 = 光标右下（装不下自动翻边），摆位判据与浏览器端共用 shared 的 tooltipPlacement。
+   *
+   * 坐标要绕一次：光标存的是**视口坐标**（this.tipCursor），而提示是 position:fixed、
+   * DOM 坐标相对**窗口**，所以这里减掉窗口原点（= 宠物包围盒左上角 − 四周余量）。
+   * 为什么要存视口坐标而不是窗口坐标：宠物自己走动/被抛出时窗口会移动，存视口坐标就只需
+   * 在这里按当前窗口原点重算一次，贴光标不会漂（sendBounds 每帧会调本函数）。
+   */
+  renderTip() {
+    if (this.tip.textContent !== this.pet.name) this.tip.textContent = this.pet.name;
+    const cursor = this.tipCursor;
+    if (cursor) {
+      const winX = this.pos.x - this.margin.l;
+      const winY = this.pos.y - this.margin.t;
+      const winW = this.size + this.margin.l + this.margin.r;
+      const winH = this.winH + this.margin.t + this.margin.b;
+      // 允许显示范围 = 窗口 ∩ 光标所在屏的工作区，两者必须取交集：
+      // 只按窗口夹，窗口能贴到屏幕外，提示会被画到看不见的地方；只按工作区夹，提示会落到窗口外
+      // （index.html 的 html,body 是 overflow:hidden，一样看不见）。
+      const area = S.resolveRect(WORK_AREAS, cursor.x, cursor.y) ?? { x: winX, y: winY, width: winW, height: winH };
+      const x0 = Math.max(winX, area.x);
+      const y0 = Math.max(winY, area.y);
+      const x1 = Math.min(winX + winW, area.x + area.width);
+      const y1 = Math.min(winY + winH, area.y + area.height);
+      const p = S.tooltipPlacement(
+        { x: cursor.x - winX, y: cursor.y - winY },
+        { w: this.tip.offsetWidth, h: this.tip.offsetHeight },
+        { x: x0 - winX, y: y0 - winY, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) },
+        this.size * S.TOOLTIP_GAP_RATIO,
+      );
+      this.tip.style.left = p.x + 'px';
+      this.tip.style.top = p.y + 'px';
+    }
+    this.tip.classList.toggle('is-on', this.tipOn);
+    window.__dshPetDebug.tooltipOn = this.tipOn;
+  }
+
   onMouseMove(e) {
+    // 拖拽态下所有按键已松开：说明 pointerup/pointercancel/lostpointercapture 全部丢失，
+    // 就地按松手收尾，否则 dragState.active 与 inputBusy 永久为 true（穿透永不恢复）。
+    if (this.dragState.active && e.buttons === 0) {
+      this.onPointerUp(e);
+      return;
+    }
     // 拖拽中窗口逐帧跟随光标、指针相对窗口坐标会有帧级抖动——强制保持可交互，绝不翻转（翻转会断拖拽）
     if (this.dragState.active) {
       this.setInteractive(true);
@@ -959,7 +1099,9 @@ class PetSprite {
     }
     // 右键菜单/对话弹窗开启：整窗保持可交互（悬停菜单项/点输入框都不触发穿透翻转）；关闭后恢复命中区判定
     if (this.menuOpen || this.chatOpen) {
+      this.syncInputRegions(); // 级联菜单按悬停增减面板，及时更新其真实占用区域
       this.setInteractive(true);
+      this.setTip(false); // 菜单/弹窗期间提示让位：光标已不在身体上，也不该跟浮层抢注意力
       return;
     }
     const r = this.hitRect;
@@ -970,7 +1112,15 @@ class PetSprite {
     const wy = Number.isFinite(e.clientY) ? e.clientY : toLocal(e.screenY) - (this.pos.y + VIEW.y - this.margin.t);
     const px = wx - this.margin.l;
     const py = wy - this.margin.t;
-    this.setInteractive(px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h);
+    const inBody = px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+    // 光标位置存**视口坐标**（窗口原点 + 窗口内坐标）：窗口随宠物移动时贴光标不会漂，见 renderTip。
+    // 必须在 setTip 之前更新：setTip 变显隐时会立刻渲染一次，晚一步就会用上一次的光标摆位。
+    if (inBody) this.tipCursor = { x: this.pos.x - this.margin.l + wx, y: this.pos.y - this.margin.t + wy };
+    this.setInteractive(inBody);
+    // 悬浮提示与可交互判定同源（同一个 inBody）：光标进身体 → 提示出现，离开 → 收起
+    this.setTip(inBody);
+    // 跟随光标：位置依赖光标，所以每次移动都得重摆一次（setTip 只在显隐变化时才渲染）
+    if (this.tipOn) this.renderTip();
   }
 
   onClick() {
@@ -1004,7 +1154,7 @@ class PetSprite {
     // 比较双方都用屏幕坐标（坐标系不混），返回的夹取矩形仍是窗口局部坐标。
     // 夹取用**宠物所在的那块屏**而不是外接矩形：外接矩形含空洞，按它夹菜单会伸进
     // 不属于任何显示器的区域（看不见）；菜单本来也不该跨屏显示。
-    const area = S.resolveRect(AREAS, this.pos.x + this.halfW, this.pos.y + this.halfH);
+    const area = S.resolveRect(WORK_AREAS, this.pos.x + this.halfW, this.pos.y + this.halfH);
     if (!area) return null;
     const winX = this.pos.x + VIEW.x - this.margin.l;
     const winY = this.pos.y + VIEW.y - this.margin.t;
@@ -1030,7 +1180,8 @@ class PetSprite {
     this.stopMove(); // 菜单悬停期间宠物不漫游
     // 桌面专属工具根项（打开网站 / 查看余额 / 碎碎念 / 对话 / 回到初始位置 / 重载配置）+ 共享菜单树（动作→分类→具体动画）
     // 碎碎念/对话项无条件显示：手动触发不受 whisperEnabled 限制（该字段只影响自动周期轮询）
-    const tools = [{ label: '打开网站', action: 'open-site' }];
+    // 首项文案随宿主形态变（OPEN_TARGET）：宿主是 DSH 桌面应用时点是"唤起桌面应用窗口"，仍叫「打开网站」会误导
+    const tools = [{ label: OPEN_TARGET === 'desktop' ? '打开 DeepSeek Harness' : '打开网站', action: 'open-site' }];
     if (this.pet.balanceEnabled) tools.push({ label: '查看余额', action: 'show-balance' });
     tools.push(
       { label: '碎碎念', action: 'whisper' },
@@ -1058,9 +1209,11 @@ class PetSprite {
         this.menuOpen = false;
         window.__dshPetDebug.menuOpen = false;
         this.syncInputBusy();
+        if (!this.inputBusy()) this.setInteractive(false);
       },
     });
     this.menuClose = m.close;
+    this.syncInputRegions(); // mountContextMenu 完成布局后才能读取菜单矩形
   }
 
   onMenuAction(leaf) {
@@ -1112,6 +1265,7 @@ class PetSprite {
     this.menuOpen = false;
     window.__dshPetDebug.menuOpen = false;
     this.syncInputBusy(); // 菜单关：若没有别的占用（拖拽/弹窗）则交还常规判定
+    if (!this.inputBusy()) this.setInteractive(false);
   }
 
   // 「查看余额」菜单 / 左键点身体：**同一条**触发路径（triggerBalanceNow）。
