@@ -95,15 +95,11 @@ describe('源码守卫 —— 置顶看门狗必须在 main.js 里按这套规�
     return m[1];
   };
 
-  test('建窗时那次置顶不能删，且看门狗走的是同一个 API（screen-saver 档）', () => {
-    assert.ok(
-      /win\.setAlwaysOnTop\(true, 'screen-saver'\);/.test(main),
-      '建窗时必须先置顶一次（看门狗只负责复查，不能当成唯一置顶来源）',
-    );
-    assert.ok(
-      (main.match(/win\.setAlwaysOnTop\(true, 'screen-saver'\)/g) ?? []).length >= 2,
-      '看门狗必须再钉一次同档位（HWND_TOPMOST 落带靠它；moveTop 的 HWND_TOP 对已沉底窗口无效）',
-    );
+  test('建窗时那次置顶不能删，且看门狗走的是同一个 API、同一档位', () => {
+    const asserted = main.match(/win\.setAlwaysOnTop\(true, '[a-z-]+'\)/g) ?? [];
+    assert.ok(asserted.length >= 1, '建窗时必须先置顶一次（看门狗只负责复查，不能当成唯一置顶来源）');
+    assert.ok(asserted.length >= 2, '看门狗必须再钉一次同档位（HWND_TOPMOST 落带靠它；moveTop 的 HWND_TOP 对已沉底窗口无效）');
+    assert.equal(new Set(asserted).size, 1, '建窗与看门狗必须用同一档位（不同档会把窗口钉到不同的 z 序位置）');
     assert.ok(
       /require\('\.\/topmost-watchdog\.js'\)/.test(main),
       '看门狗判定必须复用 runtime/electron-helper/topmost-watchdog.js（纯逻辑有单测）',

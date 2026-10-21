@@ -427,7 +427,11 @@ function createPetWindows() {
         spellcheck: false,
       },
     });
-    win.setAlwaysOnTop(true, 'screen-saver');
+    // 置顶档位用 'floating'：Windows 上该档会把窗口钉到任务栏之后（Electron 的
+    // MoveBehindTaskBarIfNeeded → SetWindowPos(Shell_TrayWnd)），于是被任务栏与
+    // 位于任务栏之前的全屏黑幕挡住；'screen-saver' 会压在任务栏与黑幕之上。
+    // 代价：宠物贴屏幕底部时下半身会被任务栏切掉（见 DESIGN 的层级说明）。
+    win.setAlwaysOnTop(true, 'floating');
     win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     // 窗口被其他窗口（另一只宠物）完全遮挡时，Chromium 默认会暂停本窗口渲染，
     // 导致大宠物移动盖过小宠物时小宠物显示为"消失"。关闭后台节流，让被遮挡
@@ -493,7 +497,7 @@ function createPetWindows() {
       });
       if (!due) return;
       lastTopmostAssertMs = nowMs;
-      win.setAlwaysOnTop(true, 'screen-saver');
+      win.setAlwaysOnTop(true, 'floating'); // 与建窗同档：每拍重钉都重新钉回任务栏之后
     }, TOPMOST_WATCHDOG_TICK_MS);
     win.on('closed', () => {
       clearInterval(pointerTimer);
