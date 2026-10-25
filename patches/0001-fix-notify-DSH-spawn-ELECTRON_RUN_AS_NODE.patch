@@ -1,0 +1,357 @@
+From cd4ff0598f6091618acc1c0d764a0cdeaeed6679 Mon Sep 17 00:00:00 2001
+From: pc2005 <2194844980@qq.com>
+Date: Mon, 5 Oct 2026 19:19:45 +0800
+Subject: [PATCH] =?UTF-8?q?fix(notify):=20=E7=82=B9=E5=87=BB=E7=B3=BB?=
+ =?UTF-8?q?=E7=BB=9F=E9=80=9A=E7=9F=A5=E6=8A=8A=20DSH=20=E7=AA=97=E5=8F=A3?=
+ =?UTF-8?q?=E5=89=8D=E7=BD=AE=EF=BC=88spawn=20=E5=88=A0=20ELECTRON=5FRUN?=
+ =?UTF-8?q?=5FAS=5FNODE=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+现象：DSH 桌面壳最小化时，点系统通知完全没有反应（窗口不还原、也不前置）。
+
+两个叠加的根因：
+1. 渲染端 window.focus() 只聚焦、不还原最小化窗口——还原必须由 Electron 主进程
+   restore()/show() 做，而 DSH 页面拿不到任何「前置窗口」的 IPC，也打不开 dsh://
+   （主窗口 will-navigate 只放行 http/https）。
+2. 宿主 spawn 时把 ELECTRON_RUN_AS_NODE 透传给了子进程：cmd /c start 拉起的
+   DeepSeek Harness.exe 以纯 Node 模式启动，把 dsh://open 当模块名 require，38ms 后
+   MODULE_NOT_FOUND 崩掉（exit code 1）——既没有第二实例，也没人去抢单实例锁。
+   与 issue #63 是同一类坑（设空串会让 Electron abort，必须删键）。
+
+修法：
+- client：通知点击后 POST /dsh-pet-7340/raise（仅桌面壳；浏览器保持原行为），
+  设置页「测试通知」复用同一份点击语义（bindNotificationClick）。
+- host：新增 POST /raise → raiseDesktopWindow()：借 DSH 自己注册的 dsh:// 协议再启动
+  一次，已有实例收到 second-instance → focusPrimaryWindow() → restore + show + focus；
+  spawn 走 desktopSpawnEnv()（删掉 ELECTRON_RUN_AS_NODE），带 1s 连点节流。
+- openapi.yaml 补 /raise 条目；新增 desktop-raise.test.ts 守卫（删键 / spawn 传 env / 路由在位）。
+
+验证：Windows 11 + DSH 桌面壳实测——最小化后调 /raise，热态 130~220ms 窗口还原并前置
+（冷启动首次约 1.4s）；不带本次修复时同一路径 38ms 退出、窗口纹丝不动。新增 5 项测试通过，
+check:openapi 通过（路由对齐含 raise）。
+---
+ dsh-pet/src/client/notify.ts           | 43 +++++++++++++++--
+ dsh-pet/src/client/settings.ts         |  8 ++--
+ dsh-pet/src/host/desktop-raise.test.ts | 66 ++++++++++++++++++++++++++
+ dsh-pet/src/host/desktop-raise.ts      | 63 ++++++++++++++++++++++++
+ dsh-pet/src/host/index.ts              | 13 +++++
+ openapi.yaml                           | 32 +++++++++++++
+ 6 files changed, 217 insertions(+), 8 deletions(-)
+ create mode 100644 dsh-pet/src/host/desktop-raise.test.ts
+ create mode 100644 dsh-pet/src/host/desktop-raise.ts
+
+diff --git a/dsh-pet/src/client/notify.ts b/dsh-pet/src/client/notify.ts
+index bbd8d17..2409f02 100644
+--- a/dsh-pet/src/client/notify.ts
++++ b/dsh-pet/src/client/notify.ts
+@@ -51,6 +51,41 @@ function isPageActive(): boolean {
+   return pageVisible && pageFocused;
+ }
+ 
++// ---------- 桌面壳：把 DSH 窗口提到前台 ----------
++
++/** 是否运行在 DSH 桌面壳（Electron 窗口）里。
++ *  判据用 preload 只在 `dsh-app://app` 页面暴露的 `dshDesktop`（协议/主机名同源，最可靠），
++ *  兜底再看 location.protocol——浏览器（http/https）下两者都不成立，保持纯浏览器行为。 */
++function inDesktopShell(): boolean {
++  try {
++    if (location.protocol === 'dsh-app:') return true;
++    const api = (window as unknown as { dshDesktop?: { protocolVersion?: unknown } }).dshDesktop;
++    return typeof api?.protocolVersion === 'number';
++  } catch {
++    return false; // 极端环境（无 location/window）：按非桌面处理，绝不因环境探测抛错打断通知
++  }
++}
++
++/** 请宿主把 DSH 桌面窗口前置（含从最小化还原）。
++ *  Electron 渲染端 `window.focus()` 只聚焦、**不还原最小化窗口**（还原必须由主进程
++ *  `restore()/show()` 做），而 DSH 页面没有前置窗口的 IPC——因此交给宿主经 `dsh://`
++ *  协议再启动一次（见 host 的 `/dsh-pet-7340/raise`）。浏览器里是空操作；
++ *  请求失败静默：通知本身已经发出，不该因为前置失败报错。 */
++function raiseDesktopWindow(): void {
++  if (!inDesktopShell()) return;
++  void fetch('/dsh-pet-7340/raise', { method: 'POST' }).catch(() => {});
++}
++
++/** 通知点击后的统一行为：聚焦页面（浏览器语义）+ 请宿主前置桌面窗口 + 关闭这条通知。
++ *  导出给设置页的「测试通知」复用——两处点击语义必须一致，不各写一份。 */
++export function bindNotificationClick(n: Notification): void {
++  n.onclick = () => {
++    window.focus();
++    raiseDesktopWindow();
++    n.close();
++  };
++}
++
+ // ---------- 发送 ----------
+ 
+ /** 图标 URL（pic 路由由宿主提供：assets/pic → /dsh-pet-7340/pic/<file>） */
+@@ -80,12 +115,10 @@ function toast(title: string, body?: string, icon?: string): void {
+     const opts: NotificationOptions = {};
+     if (body) opts.body = truncate(body);
+     if (icon) opts.icon = icon;
+-    // 点击通知：聚焦回 DSH 页面并关闭该通知（图标加载失败只降级为无图标，绝不关闭弹窗）
++    // 点击通知：聚焦回 DSH 页面（桌面壳下还要请宿主还原/前置窗口）并关闭该通知
++    //（图标加载失败只降级为无图标，绝不关闭弹窗）
+     const n = new Notification(title, opts);
+-    n.onclick = () => {
+-      window.focus();
+-      n.close();
+-    };
++    bindNotificationClick(n);
+   } catch {
+     /* 个别环境（e.g. 部分桌面壳）可能在构造时抛错：忽略，不打断业务 */
+   }
+diff --git a/dsh-pet/src/client/settings.ts b/dsh-pet/src/client/settings.ts
+index 57da827..2d50a16 100644
+--- a/dsh-pet/src/client/settings.ts
++++ b/dsh-pet/src/client/settings.ts
+@@ -13,7 +13,7 @@
+  */
+ import { PET_DISPLAYS } from '../shared/config';
+ import { DEFAULT_PHYSICS } from '../shared/physics';
+-import { NOTIFY_ICONS, reloadNotifications, requestNotificationPermission } from './notify';
++import { NOTIFY_ICONS, bindNotificationClick, reloadNotifications, requestNotificationPermission } from './notify';
+ import type { Corner, ModelSelection, Pet, PetDisplay, PhysicsParams } from '../shared/types';
+ import type { ChangeEvent, Dispatch, FunctionComponent, SetStateAction } from 'react';
+ import type * as ReactNS from 'react';
+@@ -1048,8 +1048,10 @@ export function makePetConfigSection(rt: {
+         return;
+       }
+       try {
+-        // 成功即发一条测试通知验证链路（绕过聚焦门，直接确认）
+-        new Notification('测试通知', { body: '【dsh-pet】系统通知已就绪。', icon: NOTIFY_ICONS.test });
++        // 成功即发一条测试通知验证链路（绕过聚焦门，直接确认）；
++        // 点击语义与正式通知一致（浏览器聚焦 / 桌面壳请宿主前置窗口）
++        const n = new Notification('测试通知', { body: '【dsh-pet】系统通知已就绪。', icon: NOTIFY_ICONS.test });
++        bindNotificationClick(n);
+       } catch {
+         /* 个别环境构造失败：仍按已授权提示 */
+       }
+diff --git a/dsh-pet/src/host/desktop-raise.test.ts b/dsh-pet/src/host/desktop-raise.test.ts
+new file mode 100644
+index 0000000..471e32b
+--- /dev/null
++++ b/dsh-pet/src/host/desktop-raise.test.ts
+@@ -0,0 +1,66 @@
++/**
++ * desktop-raise 单元测试 —— 桌面窗口前置（点击系统通知 → POST /raise）的两条关键约束：
++ *   1. spawn 必须走 desktopSpawnEnv：宿主是 Electron 应用，`ELECTRON_RUN_AS_NODE` 透传会让拉起的
++ *      `DeepSeek Harness.exe` 以纯 Node 模式启动、把 `dsh://open` 当成模块名 require 后当场崩掉
++ *      （与 issue #63 同一类坑，症状是"点了通知完全没反应"）；
++ *   2. handler 里的 `/raise` 路由必须在位且只认 POST（浏览器半侧点击通知时调它）。
++ * 纯函数直接断言，spawn / 路由用源码守卫 —— 与 helper-process.test.ts、host-liveness.test.ts 同一写法。
++ *
++ * 用 Node 内置 test runner（node:test），不引入任何 npm 依赖：
++ *   node --experimental-strip-types --test src/host/desktop-raise.test.ts
++ */
++import { test, describe } from 'node:test';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++
++import { desktopSpawnEnv } from './desktop-raise';
++
++const src = readFileSync(new URL('./desktop-raise.ts', import.meta.url), 'utf8');
++const hostSrc = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
++
++describe('desktopSpawnEnv —— spawn 环境构造（host 是 Electron 宿主，必须删键）', () => {
++  test('删除 ELECTRON_RUN_AS_NODE（不是置空串：设空串会让 Electron 直接 abort）', () => {
++    const saved = process.env.ELECTRON_RUN_AS_NODE;
++    process.env.ELECTRON_RUN_AS_NODE = '1';
++    try {
++      const env = desktopSpawnEnv();
++      assert.equal('ELECTRON_RUN_AS_NODE' in env, false, '必须删键');
++    } finally {
++      if (saved === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
++      else process.env.ELECTRON_RUN_AS_NODE = saved;
++    }
++  });
++
++  test('只产出副本：不改写宿主自己的 process.env', () => {
++    const saved = process.env.DSH_PET_RAISE_MARKER;
++    process.env.DSH_PET_RAISE_MARKER = 'from-host';
++    try {
++      assert.equal(desktopSpawnEnv().DSH_PET_RAISE_MARKER, 'from-host');
++      assert.equal(process.env.DSH_PET_RAISE_MARKER, 'from-host');
++    } finally {
++      if (saved === undefined) delete process.env.DSH_PET_RAISE_MARKER;
++      else process.env.DSH_PET_RAISE_MARKER = saved;
++    }
++  });
++});
++
++describe('守卫：spawn 与路由必须按契约在位', () => {
++  test('spawn 调用带 env: desktopSpawnEnv()（防回退成继承宿主环境）', () => {
++    assert.ok(
++      /spawn\('cmd\.exe',[\s\S]{0,300}?env: desktopSpawnEnv\(\)/.test(src),
++      'spawn 必须显式传 env: desktopSpawnEnv()，否则拉起的 exe 会以 Node 模式当场崩掉',
++    );
++    assert.ok(/delete env\.ELECTRON_RUN_AS_NODE;/.test(src), '删键那行不能被删掉');
++  });
++
++  test('只认 Windows：非 win32 直接返回 false，不起进程', () => {
++    assert.ok(/process\.platform !== 'win32'/.test(src), '非 Windows 必须短路');
++  });
++
++  test('/raise 路由存在、只认 POST，并调用 raiseDesktopWindow', () => {
++    const block = /if \(rest === 'raise'\)[\s\S]{0,400}?\n {4}\}/.exec(hostSrc)?.[0] ?? '';
++    assert.ok(block.length > 0, 'handler 里找不到 /raise 路由');
++    assert.ok(/method !== 'POST'/.test(block), '/raise 只应接受 POST');
++    assert.ok(/raiseDesktopWindow\(\)/.test(block), '/raise 必须调用 raiseDesktopWindow');
++  });
++});
+diff --git a/dsh-pet/src/host/desktop-raise.ts b/dsh-pet/src/host/desktop-raise.ts
+new file mode 100644
+index 0000000..4126430
+--- /dev/null
++++ b/dsh-pet/src/host/desktop-raise.ts
+@@ -0,0 +1,63 @@
++/**
++ * 桌面窗口前置（host 半侧）：把 DSH 主窗口从最小化还原并提到前台。
++ *
++ * 调用方：浏览器半侧点击系统通知后（notify.ts 的 bindNotificationClick）POST `/dsh-pet-7340/raise`。
++ *
++ * 为什么要绕这一圈：Electron **渲染端** `window.focus()` 只聚焦、不还原最小化窗口（还原只能由主进程
++ * `win.restore()/show()` 做），而 DSH 页面拿不到任何"前置窗口"的 IPC（`window.dshDesktop` 只有
++ * browser/deviceInfo/keyboard/shortcuts/updates），页面里也打不开 `dsh://`（主窗口 will-navigate 只放行
++ * http/https）。所以这里借 DSH 自己注册的 `dsh://` 协议**再启动一次**：第二个实例抢单实例锁失败后
++ * 立刻退出，已有实例收到 `second-instance` → `focusPrimaryWindow()` → restore + show + focus。
++ * 该协议随 DSH Desktop 安装注册（`HKCU\Software\Classes\dsh`）；实测热态约 0.2s 完成前置
++ * （冷启动第一次约 1.4s：协议解析 + 加载 244MB 的 exe）。
++ *
++ * 平台：只有 Windows 桌面壳有 `dsh://` 与单实例前置语义，其余平台直接返回 false（浏览器里本就不该调）。
++ */
++import { spawn } from 'node:child_process';
++
++/** 连点节流：进程已在起的路上就不再起第二个（避免连点刷出一串第二实例） */
++export const RAISE_THROTTLE_MS = 1000;
++
++/** 上一次发起前置的时间戳（0 = 本进程还没发起过） */
++let lastRaiseAt = 0;
++
++/**
++ * spawn 子进程用的环境变量：**必须删除 `ELECTRON_RUN_AS_NODE`**（与 issue #63 同一类坑）。
++ *
++ * 宿主（DSH Desktop 的 dsh-desktop-host）自己的 `process.env` 里带着这个键（外壳 fork 宿主时就设了），
++ * 原样透传 → `cmd /c start` 拉起的 `DeepSeek Harness.exe` 会以**纯 Node 模式**启动：它把 `dsh://open`
++ * 当成模块名去 require，几十毫秒后 `MODULE_NOT_FOUND` 崩掉（实测 exit code 1 / 38ms）——于是既没有
++ * 第二实例、也没人去抢单实例锁、更不会还原窗口（用户看到的就是"点了通知没反应"）。
++ * 删掉该键后同一条命令实测 130~220ms 完成窗口前置。
++ *
++ * 为什么是"删除"而不是设成空串：Electron 只看该键**存不存在**（设 `''` 会直接 abort）。
++ */
++export function desktopSpawnEnv(): NodeJS.ProcessEnv {
++  const env: NodeJS.ProcessEnv = { ...process.env };
++  delete env.ELECTRON_RUN_AS_NODE;
++  return env;
++}
++
++/**
++ * 发起一次窗口前置。
++ * @param now - 当前时间戳；测试可注入，默认 `Date.now()`
++ * @returns 是否成功发起（真正的还原由已有实例完成；节流命中 / 非 Windows / spawn 失败都返回 false，静默）
++ */
++export function raiseDesktopWindow(now: number = Date.now()): boolean {
++  if (process.platform !== 'win32') return false;
++  if (now - lastRaiseAt < RAISE_THROTTLE_MS) return false;
++  lastRaiseAt = now;
++  try {
++    // windowsHide：不闪控制台窗；detached + stdio ignore：第二实例与宿主脱钩，宿主退出不受其影响。
++    // env 必须走 desktopSpawnEnv：否则子进程继承 ELECTRON_RUN_AS_NODE，拉起的 exe 以 Node 模式当场崩掉。
++    spawn('cmd.exe', ['/c', 'start', '', 'dsh://open'], {
++      windowsHide: true,
++      detached: true,
++      stdio: 'ignore',
++      env: desktopSpawnEnv(),
++    }).unref();
++    return true;
++  } catch {
++    return false;
++  }
++}
+diff --git a/dsh-pet/src/host/index.ts b/dsh-pet/src/host/index.ts
+index 577dfee..ef12c4a 100644
+--- a/dsh-pet/src/host/index.ts
++++ b/dsh-pet/src/host/index.ts
+@@ -23,6 +23,9 @@
+  *   /dsh-pet-7340/reload              → 桌面端「重载配置」（右键菜单，POST）：重启桌面 Helper，全部桌面
+  *                                宠物窗口按最新配置重建（改配置文件后不必回设置页点保存）；与保存走
+  *                                **同一条**重启路径（syncDesktop），宠物数量/display/size 变化同样生效
++ *   /dsh-pet-7340/raise               → 桌面窗口前置（POST 动作端点，仅 Windows）：借 DSH 自己注册的
++ *                                `dsh://` 协议再启动一次，单实例锁让已有实例 restore+show+focus；
++ *                                渲染端 window.focus() 无法还原最小化窗口，故点系统通知走这条（见 desktop-raise.ts）
+  *   /dsh-pet-7340/config/meta         → 配置文件与素材目录路径 + 全部存储位置清单
+  *                                       （设置页「高级配置」「卸载与存储」展示用）
+  *   /dsh-pet-7340/models              → 可选「服务商 + 模型」清单（设置页「AI 模型」下拉框数据源；
+@@ -75,6 +78,7 @@ import { configuredModel } from './model-selection';
+ import { limitPool, pickMeme, readMemePool } from './memes';
+ import { decideBroadcast, normalizeBroadcastText } from './broadcast';
+ import { decideAnim } from './anim';
++import { raiseDesktopWindow } from './desktop-raise';
+ import {
+   findPetInstance,
+   flattenPetList,
+@@ -853,6 +857,15 @@ export function apply(ctx: any): void {
+       return { kind: 'json', status: 200, obj: { reloading: true } };
+     }
+ 
++    // 桌面窗口前置：/dsh-pet-7340/raise（POST 动作端点，仅 Windows）
++    // 浏览器半侧点击系统通知后调它：渲染端 `window.focus()` 无法还原最小化窗口（还原必须由主进程
++    // `restore()/show()` 做），所以由宿主借 DSH 自己注册的 `dsh://` 协议把窗口前置（细节见 desktop-raise.ts）。
++    // 动作端点，只回 {ok}：ok = 是否成功发起（真正的还原由已有实例完成；节流 / 非 Windows / spawn 失败均为 false）。
++    if (rest === 'raise') {
++      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
++      return { kind: 'json', status: 200, obj: { ok: raiseDesktopWindow() } };
++    }
++
+     // 配置文件路径 + 存储位置清单（设置页「高级配置」与「卸载与存储」展示用）
+     if (rest === 'config/meta') {
+       return {
+diff --git a/openapi.yaml b/openapi.yaml
+index 3ccc021..39294ef 100644
+--- a/openapi.yaml
++++ b/openapi.yaml
+@@ -714,6 +714,38 @@ paths:
+         "405":
+           $ref: "#/components/responses/MethodNotAllowed"
+ 
++  /dsh-pet-7340/raise:
++    post:
++      tags: [Action]
++      operationId: raise
++      summary: 前置 DSH 桌面窗口（含从最小化还原）
++      description: |
++        把 DSH 主窗口从最小化还原并提到前台。**仅 Windows 桌面壳**有效（其余平台 `ok` 恒为 `false`）。
++
++        浏览器半侧点击系统通知后调用它：渲染端 `window.focus()` 只能聚焦、**无法还原最小化窗口**
++        （还原必须由 Electron 主进程 `restore()/show()` 做），因此由宿主借 DSH 自己注册的 `dsh://`
++        协议再启动一次——第二个实例抢单实例锁失败后立刻退出，已有实例收到 `second-instance` 后
++        执行 `restore + show + focus`。实测热态约 0.2s 完成前置（冷启动首次约 1.4s）。
++
++        **节流**：1 秒内重复调用不重复起进程，直接返回 `ok: false`。
++
++        **`ok` 语义**：`true` = 已发起（真正的还原由已有实例异步完成）；`false` = 未发起
++        （节流命中 / 非 Windows / 进程起不来）。
++      responses:
++        "200":
++          description: 已发起前置，或按上面的语义未发起
++          content:
++            application/json:
++              schema:
++                type: object
++                required: [ok]
++                properties:
++                  ok:
++                    type: boolean
++                    description: 是否成功发起
++        "405":
++          $ref: "#/components/responses/MethodNotAllowed"
++
+   "/dsh-pet-7340/thumb/{petId}/{file}":
+     get:
+       tags: [Assets]
+-- 
+2.55.0.windows.5
+
